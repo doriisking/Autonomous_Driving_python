@@ -5,7 +5,7 @@ from nav_msgs.msg import OccupancyGrid
 import time
 from collections import deque
 
-from distmap_cuda_def import build_dist_map_bfs_cuda,distmap_to_occupancygrid
+from distmap_cuda_def import build_dist_map_bfs_cuda,build_dist_map_bf_cuda,distmap_to_occupancygrid
 
 
 
@@ -35,8 +35,10 @@ class DistMapPublisher(Node):
         start = time.time()
 
         # 거리맵 계산 (GPU)
+        ## 1. bfs
         dist_map = build_dist_map_bfs_cuda(msg, max_dist=2.0)
-
+        ## 2. bf
+        dist_map= build_dist_map_bf_cuda(msg,max_dist=2.0)
         # OccupancyGrid로 변환 및 퍼블리시
         dist_msg = distmap_to_occupancygrid(dist_map, msg, max_dist=2.0)
         self.publisher.publish(dist_msg)
