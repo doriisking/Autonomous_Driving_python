@@ -112,140 +112,87 @@ def build_dist_map_bfs_cuda(occupancy_grid_msg, max_dist=5.0):
 
 
 
-def build_dist_map_bf_cuda(occupancy_grid_msg, max_dist=2.0):
+def build_dist_map_bf_cuda(occupancy_grid_msg, max_dist=5.0):
     """
-    Bruteforce 거리맵 (CUDA 커널 사용, pycuda SourceModule 기반)
-    - occupancy_grid_msg: nav_msgs/OccupancyGrid
-    - max_dist: 최대 거리 [m]
-    returns: dist_map (numpy.float32) [m], shape (height, width)
+    CUDA 병렬화된 Brute-Force 거리맵 생성
+    occupancy_grid_msg : ROS OccupancyGrid 메시지
+    max_dist           : 거리 제한 [m]
     """
 
-    # --- 1) 기본 정보 추출 ---
-    width  = int(occupancy_grid_msg.info.width)
-    height = int(occupancy_grid_msg.info.height)
-    res    = float(occupancy_grid_msg.info.resolution)
-    data_np = np.array(occupancy_grid_msg.data, dtype=np.int8).reshape((height, width))
+    # --- 기본 정보 추출 ---
+    width  = occupancy_grid_msg.info.width
+    height = occupancy_grid_msg.info.height
+    res    = occupancy_grid_msg.info.resolution
+    data   = np.array(occupancy_grid_msg.data, dtype=np.int8).reshape(height, width)
 
-    # 빈 장애물 맵이면 전부 max_dist
-    obs_positions = np.argwhere(data_np > 0).astype(np.int32)  # shape (N_obs, 2) -> (row(y), col(x))
-    n_obs = obs_positions.shape[0]
+    # 장애물 좌표 목록 생성
+    obstacle_coords = np.argwhere(data > 0).astype(np.int32)
+    n_obs = obstacle_coords.shape[0]
     if n_obs == 0:
-        return np.full((height, width), float(max_dist), dtype=np.float32)
+        return np.full((height, width), max_dist, dtype=np.float32)
 
-    # --- CPU 폴백 함수 (원본 bruteforce) ---
-    def cpu_bruteforce():
-        dist_sq = np.full((height, width), (max_dist * max_dist), dtype=np.float32)
-        l = int(math.ceil(max_dist / res))
-        for j in range(width):          # x index
-            for k in range(height):     # y index
-                if data_np[k, j] > 0:   # obstacle at (j,k)
-                    for x in range(max(0, j - l), min(width, j + l + 1)):
-                        for y in range(max(0, k - l), min(height, k + l + 1)):
-                            dx = (x - j)
-                            dy = (y - k)
-                            d2 = (dx * dx + dy * dy) * (res * res)
-                            if d2 < dist_sq[y, x]:
-                                dist_sq[y, x] = d2
-        dist_map = np.sqrt(dist_sq)
-        dist_map[dist_map > max_dist] = max_dist
-        return dist_map.astype(np.float32)
+    # 거리맵 초기화
+    dist_map = np.full((height, width), max_dist, dtype=np.float32)
 
-    # --- 2) pycuda 사용 가능성 체크 ---
-    if not pycuda_available:
-        # pycuda가 없으면 CPU 버전 반환
-        print("[build_dist_map_bruteforce_cuda] pycuda not available -> CPU fallback")
-        return cpu_bruteforce()
-
-    # --- 3) CUDA C 커널 (픽셀 스레드: 모든 장애물 순회) ---
-    kernel_code = r"""
-    extern "C" {
-    __global__ void bruteforce_min_dist(
-        const int *obs_x, const int *obs_y, const int n_obs,
-        const float res_sq, const float max_d2,
-        float *out_dist2, const int width, const int height)
+    # CUDA 커널 코드 (각 셀이 모든 장애물과 거리 계산 → 최소값 선택)
+    kernel_code = """
+    __global__ void compute_dist_map(
+        float *dist, const int *obstacles, int n_obs,
+        int width, int height, float res, float max_dist)
     {
-        // 2D index from block/grid
         int x = blockIdx.x * blockDim.x + threadIdx.x;
         int y = blockIdx.y * blockDim.y + threadIdx.y;
+        if (x >= width || y >= height)
+            return;
 
-        if (x >= width || y >= height) return;
+        float min_d2 = max_dist * max_dist;
 
-        int idx = y * width + x;
-
-        float min_d2 = max_d2;
-
-        // loop over obstacles
-        for (int i = 0; i < n_obs; ++i) {
-            float dx = (float)(x - obs_x[i]);
-            float dy = (float)(y - obs_y[i]);
-            float d2 = (dx * dx + dy * dy) * res_sq;
-            if (d2 < min_d2) {
+        for (int i = 0; i < n_obs; i++) {
+            int ox = obstacles[2 * i + 1]; // x (col)
+            int oy = obstacles[2 * i + 0]; // y (row)
+            float dx = (float)(x - ox);
+            float dy = (float)(y - oy);
+            float d2 = (dx * dx + dy * dy) * res * res;
+            if (d2 < min_d2)
                 min_d2 = d2;
-            }
         }
 
-        out_dist2[idx] = min_d2;
+        int idx = y * width + x;
+        dist[idx] = sqrtf(min_d2);
     }
-    } // extern "C"
     """
 
-    # --- 4) 커널 컴파일 및 함수 얻기 ---
+    # CUDA 컴파일
     mod = SourceModule(kernel_code)
-    kernel = mod.get_function("bruteforce_min_dist")
+    kernel = mod.get_function("compute_dist_map")
 
-    # --- 5) GPU 메모리 할당 및 데이터 업로드 ---
-    # split obstacle coords into X (col), Y (row)
-    obs_y = obs_positions[:, 0].astype(np.int32)  # row (y)
-    obs_x = obs_positions[:, 1].astype(np.int32)  # col (x)
+    # GPU 메모리 할당
+    dist_gpu = cuda.mem_alloc(dist_map.nbytes)
+    obs_gpu  = cuda.mem_alloc(obstacle_coords.nbytes)
 
-    # device buffers
-    obs_x_gpu = cuda.mem_alloc(obs_x.nbytes)
-    obs_y_gpu = cuda.mem_alloc(obs_y.nbytes)
+    # GPU로 데이터 복사
+    cuda.memcpy_htod(dist_gpu, dist_map)
+    cuda.memcpy_htod(obs_gpu, obstacle_coords)
 
-    # output dist squared flattened (1D)
-    total_cells = width * height
-    out_gpu = cuda.mem_alloc(total_cells * np.dtype(np.float32).itemsize)
+    # 블록 및 그리드 설정
+    block = (16, 16, 1)
+    grid_dim = ((width + 15) // 16, (height + 15) // 16)
 
-    # copy to device
-    cuda.memcpy_htod(obs_x_gpu, obs_x)
-    cuda.memcpy_htod(obs_y_gpu, obs_y)
-
-    # --- 6) kernel 런치 파라미터 ---
-    block_x = 16
-    block_y = 16
-    grid_x = (width  + block_x - 1) // block_x
-    grid_y = (height + block_y - 1) // block_y
-
-    # 상수들
-    res_sq = np.float32(res * res)
-    max_d2 = np.float32(max_dist * max_dist)
-    n_obs_i = np.int32(n_obs)
-    width_i = np.int32(width)
-    height_i = np.int32(height)
-
-    # 런치 (2D 그리드)
+    # GPU 커널 실행
     kernel(
-        obs_x_gpu, obs_y_gpu, n_obs_i,
-        res_sq, max_d2,
-        out_gpu, width_i, height_i,
-        block=(block_x, block_y, 1), grid=(grid_x, grid_y, 1)
+        dist_gpu, obs_gpu,
+        np.int32(n_obs),
+        np.int32(width), np.int32(height),
+        np.float32(res), np.float32(max_dist),
+        block=block, grid=grid_dim
     )
 
-    # 동기화 및 결과 복사
-    cuda.Context.synchronize()
+    # 결과 복사
+    cuda.memcpy_dtoh(dist_map, dist_gpu)
+    dist_map = np.clip(dist_map, 0, max_dist).astype(np.float32)
 
-    # 호스트 배열으로 복사
-    dist_sq_flat = np.empty(total_cells, dtype=np.float32)
-    cuda.memcpy_dtoh(dist_sq_flat, out_gpu)
-
-    # 재구성 및 후처리
-    dist_sq = dist_sq_flat.reshape((height, width))
-    dist_map = np.sqrt(dist_sq)
-    dist_map[np.isinf(dist_map)] = max_dist
-    dist_map[dist_map > max_dist] = max_dist
-
-    return dist_map.astype(np.float32)
-
+    print(f"✅ CUDA Brute-Force completed with {n_obs} obstacles")
+    return dist_map
 
 def distmap_to_occupancygrid(dist_map, template_msg, max_dist=5.0):
     """

@@ -18,11 +18,12 @@ from visualization_msgs.msg import Marker
 import pycuda.autoinit
 import pycuda.driver as cuda
 from pycuda.compiler import SourceModule
-
+import torch
 
 # 거리맵 함수 (같은 폴더의 distmap_def.py)
 from distmap_cuda_def import (
     build_dist_map_bfs_cuda,
+    build_dist_map_bf_cuda,
     #build_dist_map_bruteforce,
     distmap_to_occupancygrid,  # 필요 시 사용
 )
@@ -72,7 +73,7 @@ class DWACommandNode(Node):
         self.declare_parameter("marker_topic", "/dwa/local_goal_marker")
 
         # ---- 거리맵 관련 (방식 토글 + 최대거리 + 시각화) ----
-        self.declare_parameter("dist_method", "bfs")       # "bfs" | "bruteforce"
+        self.declare_parameter("dist_method", "bruteforce")       # "bfs" | "bruteforce"
         self.declare_parameter("dist_max_m", 3.0)          # 거리맵 최대 반경[m]
         self.declare_parameter("publish_distgrid", False)  # 거리맵을 OccGrid로 내보내기
 
@@ -155,7 +156,7 @@ class DWACommandNode(Node):
         if self.dist_method == "bfs":
             self._dist = build_dist_map_bfs_cuda(msg, max_dist=self.dist_max_m)
         else:
-            self._dist = build_dist_map_bruteforce(msg, max_dist=self.dist_max_m)
+            self._dist = build_dist_map_bf_cuda(msg, max_dist=self.dist_max_m)
 
         # (옵션) 거리맵을 OccGrid로 내보내어 RViz에서 확인
         # if self.pub_distgrid:
@@ -237,9 +238,11 @@ class DWACommandNode(Node):
 
         # ------ 속도 생성 ------
         theta = math.atan2(dy_dwa, dx_dwa)   # +면 좌회전
-        r = math.hypot(dx_dwa, dy_dwa)
+        r = math.hypot(dx_dwa, dy_dwa) 
 
-        vx_raw = self.kv * r * math.cos(theta)
+
+        vx_raw = self.kv * r * math.cos(theta) # cos커지면 vx 너무 작아짐
+        #vx_raw = 0.7
         wz_raw = self.kyaw * theta
 
         if not self.allow_backward and dx_dwa < 0.0:
@@ -248,7 +251,7 @@ class DWACommandNode(Node):
         if self.turn_mode and abs(theta) > self.theta_turn:
             vx_raw = 0.0  # 제자리 회전
 
-        if self.slow and bd < m:
+        if self.slow and bd < m: ## x,yaw 밸런싱
             scale = max(0.0, min(1.0, bd / m))
             vx_raw *= scale
 
